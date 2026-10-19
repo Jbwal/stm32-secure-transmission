@@ -318,7 +318,7 @@ static void MX_GPIO_Init(void)
 
 void CommunicationTask(void *argument)
 {
-    ProtocolMessage_t message;
+    ProtocolMessage_t message = {0};
 
     for (;;)
     {
@@ -345,23 +345,54 @@ void ProtocolTask(void *argument)
 {
     ProtocolMessage_t message;
 
-    for (;;)
-    {
-        if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
+for (;;)
 {
-    if (message.header.start_byte == ICD_START_BYTE)
+    if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
     {
-        const char *msg = "Trame HELLO recue\r\n";
+        /* Verification de l'octet de debut */
+        if (message.header.start_byte != ICD_START_BYTE)
+        {
+            continue;
+        }
 
-        HAL_UART_Transmit(
-            &huart2,
-            (uint8_t *)msg,
-            strlen(msg),
-            HAL_MAX_DELAY
-        );
+        /* Verification du type de commande */
+        if (message.header.command_type != CMD_MSG)
+        {
+            continue;
+        }
+
+        /* Verification de la longueur du payload */
+        if (message.header.length > MAX_PAYLOAD_SIZE)
+        {
+            continue;
+        }
+
+        /* Verification du contenu du payload */
+        if (message.header.length == 5 &&
+            memcmp(message.payload, "HELLO", 5) == 0)
+        {
+            const char *msg = "Trame HELLO recue\r\n";
+
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)msg,
+                strlen(msg),
+                HAL_MAX_DELAY
+            );
+        }
+        else
+        {
+            const char *msg = "Trame CMD_MSG inconnue\r\n";
+
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)msg,
+                strlen(msg),
+                HAL_MAX_DELAY
+            );
+        }
     }
 }
-    }
 }
 void SecurityTask(void *argument)
 {
