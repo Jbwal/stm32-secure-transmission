@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "protocol_icd.h"
 #include "string.h"
+#include <stdbool.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -89,6 +90,7 @@ void CommunicationTask(void *argument);
 void ProtocolTask(void *argument);
 void SecurityTask(void *argument);
 void StatusTask(void *argument);
+static bool Protocol_IsMessageValid(const ProtocolMessage_t *message);
 
 /* USER CODE BEGIN PFP */
 
@@ -341,55 +343,70 @@ void CommunicationTask(void *argument)
         osDelay(1000);
     }
 }
+
+static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
+{
+    if (message == NULL)
+    {
+        return false;
+    }
+
+    /* Verification de l'octet de debut */
+    if (message->header.start_byte != ICD_START_BYTE)
+    {
+        return false;
+    }
+
+    /* Verification de la longueur du payload */
+    if (message->header.length > MAX_PAYLOAD_SIZE)
+    {
+        return false;
+    }
+
+    return true;
+}
+
 void ProtocolTask(void *argument)
 {
     ProtocolMessage_t message;
 
-for (;;)
+
+    for (;;)
 {
     if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
     {
-        /* Verification de l'octet de debut */
-        if (message.header.start_byte != ICD_START_BYTE)
+        /* Verification generale de la trame */
+        if (!Protocol_IsMessageValid(&message))
         {
             continue;
         }
 
-        /* Verification du type de commande */
-        if (message.header.command_type != CMD_MSG)
+        /* Traitement des messages HELLO */
+        if (message.header.command_type == CMD_MSG)
         {
-            continue;
-        }
+            if (message.header.length == 5 &&
+                memcmp(message.payload, "HELLO", 5) == 0)
+            {
+                const char *msg = "Trame HELLO recue\r\n";
 
-        /* Verification de la longueur du payload */
-        if (message.header.length > MAX_PAYLOAD_SIZE)
-        {
-            continue;
-        }
+                HAL_UART_Transmit(
+                    &huart2,
+                    (uint8_t *)msg,
+                    strlen(msg),
+                    HAL_MAX_DELAY
+                );
+            }
+            else
+            {
+                const char *msg = "Trame CMD_MSG inconnue\r\n";
 
-        /* Verification du contenu du payload */
-        if (message.header.length == 5 &&
-            memcmp(message.payload, "HELLO", 5) == 0)
-        {
-            const char *msg = "Trame HELLO recue\r\n";
-
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)msg,
-                strlen(msg),
-                HAL_MAX_DELAY
-            );
-        }
-        else
-        {
-            const char *msg = "Trame CMD_MSG inconnue\r\n";
-
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)msg,
-                strlen(msg),
-                HAL_MAX_DELAY
-            );
+                HAL_UART_Transmit(
+                    &huart2,
+                    (uint8_t *)msg,
+                    strlen(msg),
+                    HAL_MAX_DELAY
+                );
+            }
         }
     }
 }

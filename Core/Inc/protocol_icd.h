@@ -5,7 +5,7 @@
 
 #define ICD_START_BYTE 0x7E
 #define MAX_PAYLOAD_SIZE 16
-#define DEFAULT_ID 0X0
+#define DEFAULT_ID 0X0 
 
 // Flags
 typedef enum {
