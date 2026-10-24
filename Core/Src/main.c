@@ -366,26 +366,14 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
     return true;
 }
 
-void ProtocolTask(void *argument)
+static void Protocol_ProcessMessage(const ProtocolMessage_t *message)
 {
-    ProtocolMessage_t message;
-
-
-    for (;;)
-{
-    if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
+    switch (message->header.command_type)
     {
-        /* Verification generale de la trame */
-        if (!Protocol_IsMessageValid(&message))
+        case CMD_MSG:
         {
-            continue;
-        }
-
-        /* Traitement des messages HELLO */
-        if (message.header.command_type == CMD_MSG)
-        {
-            if (message.header.length == 5 &&
-                memcmp(message.payload, "HELLO", 5) == 0)
+            if (message->header.length == 5 &&
+                memcmp(message->payload, "HELLO", 5) == 0)
             {
                 const char *msg = "Trame HELLO recue\r\n";
 
@@ -398,7 +386,7 @@ void ProtocolTask(void *argument)
             }
             else
             {
-                const char *msg = "Trame CMD_MSG inconnue\r\n";
+                const char *msg = "Payload CMD_MSG invalide\r\n";
 
                 HAL_UART_Transmit(
                     &huart2,
@@ -407,7 +395,71 @@ void ProtocolTask(void *argument)
                     HAL_MAX_DELAY
                 );
             }
+            break;
         }
+
+        case CMD_INIT:
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)"Commande INIT recue\r\n",
+                strlen("Commande INIT recue\r\n"),
+                HAL_MAX_DELAY
+            );
+            break;
+
+        case CMD_RESET:
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)"Commande RESET recue\r\n",
+                strlen("Commande RESET recue\r\n"),
+                HAL_MAX_DELAY
+            );
+            break;
+
+        case CMD_ACK:
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)"Commande ACK recue\r\n",
+                strlen("Commande ACK recue\r\n"),
+                HAL_MAX_DELAY
+            );
+            break;
+
+        case CMD_ERROR:
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)"Commande ERROR recue\r\n",
+                strlen("Commande ERROR recue\r\n"),
+                HAL_MAX_DELAY
+            );
+            break;
+
+        default:
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)"Type de commande inconnu\r\n",
+                strlen("Type de commande inconnu\r\n"),
+                HAL_MAX_DELAY
+            );
+            break;
+    }
+}
+
+
+void ProtocolTask(void *argument)
+{
+    ProtocolMessage_t message;
+
+for (;;)
+{
+    if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
+    {
+        if (!Protocol_IsMessageValid(&message))
+        {
+            continue;
+        }
+
+        Protocol_ProcessMessage(&message);
     }
 }
 }
