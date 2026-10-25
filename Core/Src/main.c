@@ -106,6 +106,7 @@ typedef enum
 static volatile ModuleState_t moduleState = MODULE_UNINITIALIZED;
 static volatile bool moduleIsMaster = false;
 static volatile uint8_t modulePosition = 0U;
+static volatile uint32_t moduleId = 0U; /* ID dynamique: maitre=1, carte suivante=2. */
 
 /* Cle de 32 bits stockee localement sur chaque carte. */
 static uint32_t moduleKey = 0U;
@@ -451,7 +452,7 @@ static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t 
     message.header.command_type = command;
     message.header.length = length;
     message.header.reserve = 0U;
-    message.header.id_src = DEFAULT_ID;
+    message.header.id_src = moduleId;
 
     if ((payload != NULL) && (length > 0U))
     {
@@ -602,7 +603,7 @@ void CommunicationTask(void *argument)
             buttonItem.message.header.command_type = CMD_RESET;
             buttonItem.message.header.length = 1U;
             buttonItem.message.header.reserve = 0U;
-            buttonItem.message.header.id_src = DEFAULT_ID;
+            buttonItem.message.header.id_src = moduleId;
             buttonItem.message.payload[0] = 0U;
             buttonItem.message.crc = 0U;
             buttonItem.source = RX_SOURCE_PC;
@@ -848,7 +849,7 @@ static void Console_ProcessLine(const char *line)
         item.message.header.command_type = CMD_RESET;
         item.message.header.length = 1U;
         item.message.header.reserve = 0U;
-        item.message.header.id_src = DEFAULT_ID;
+        item.message.header.id_src = moduleId;
         item.message.payload[0] = 0U;
         item.message.crc = 0U;
         item.source = RX_SOURCE_PC;
@@ -870,7 +871,7 @@ static void Console_ProcessLine(const char *line)
         item.message.header.command_type = CMD_INIT;
         item.message.header.length = 1U;
         item.message.header.reserve = 0U;
-        item.message.header.id_src = DEFAULT_ID;
+        item.message.header.id_src = moduleId;
         item.message.payload[0] = 0U; /* INIT = 0 selon l'ICD */
         item.message.crc = 0U;
         item.source = RX_SOURCE_PC;
@@ -899,7 +900,7 @@ static void Console_ProcessLine(const char *line)
         item.message.header.command_type = CMD_GET_INFO;
         item.message.header.length = 0U;
         item.message.header.reserve = 0U;
-        item.message.header.id_src = DEFAULT_ID;
+        item.message.header.id_src = moduleId;
         item.message.crc = 0U;
         item.source = RX_SOURCE_PC;
 
@@ -941,12 +942,12 @@ static void Console_ProcessLine(const char *line)
 
         (void)snprintf(info, sizeof(info),
                        "\r\n--- INFORMATIONS DU MODULE ---\r\n"
-                       "Identifiant (DEFAULT_ID): %lu\r\n"
+                       "Identifiant: %lu\r\n"
                        "Role: %s\r\n"
                        "Position: %u\r\n"
                        "Statut: %s\r\n"
                        "------------------------------\r\n",
-                       (unsigned long)DEFAULT_ID, role,
+                       (unsigned long)moduleId, role,
                        (unsigned int)modulePosition, state);
         Console_Write(info);
         return;
@@ -969,7 +970,7 @@ static void Console_ProcessLine(const char *line)
     item.message.header.command_type = CMD_MSG;
     item.message.header.length = (uint8_t)length;
     item.message.header.reserve = 0U;
-    item.message.header.id_src = DEFAULT_ID;
+    item.message.header.id_src = moduleId;
     memcpy(item.message.payload, &line[start], length);
 
     /*
@@ -1037,7 +1038,7 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
     /* Verifications propres aux commandes deja utilisees par le test. */
     if (message->header.command_type == CMD_INIT)
     {
-        if ((message->header.length != 1U) || (message->payload[0] != 0U))
+        if (message->header.length != 1U)
         {
             return false;
         }
@@ -1092,9 +1093,9 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
     {
         case CMD_INIT:
         {
-            if ((message->header.length < 1U) || (message->payload[0] != 0U))
+            if (message->header.length != 1U)
             {
-                Console_Write("INIT ignore: payload invalide\r\n");
+                Console_Write("INIT ignore: longueur invalide");
                 break;
             }
 
@@ -1104,11 +1105,15 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 if (moduleState == MODULE_UNINITIALIZED)
                 {
                     moduleIsMaster = true;
+                    moduleId = 1U;
                     modulePosition = 1U;
                     moduleState = MODULE_SYNCHRONIZING;
-                    Console_Write("INIT PC recue: role MAITRE, position 1\r\n");
-                    Console_Write("INIT transmis a la carte voisine; attente ACK\r\n");
-                    Protocol_SendUart1(CMD_INIT, message->payload, 1U);
+                    {
+                        uint8_t assignedId = 2U;
+                        Console_Write("INIT PC recue: role MAITRE, ID 1\r\n");
+                        Console_Write("INIT transmis a la carte voisine avec attribution de l'ID 2; attente ACK\r\n");
+                        Protocol_SendUart1(CMD_INIT, &assignedId, 1U);
+                    }
                 }
                 else if (moduleIsMaster)
                 {
@@ -1121,13 +1126,23 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             }
             else
             {
-                /* INIT venant de la carte precedente: cette carte devient esclave. */
+                /* L'ID de l'esclave est attribue par le maitre dans le payload INIT. */
+                if (message->payload[0] == 0U)
+                {
+                    Console_Write("INIT USART1 refuse: ID attribue invalide.\r\n");
+                    break;
+                }
                 if (moduleState == MODULE_UNINITIALIZED)
                 {
+                    char idText[80];
                     moduleIsMaster = false;
-                    modulePosition = 2U; /* Topologie de test a deux cartes. */
+                    moduleId = (uint32_t)message->payload[0];
+                    modulePosition = message->payload[0];
                     moduleState = MODULE_SYNCHRONIZED;
-                    Console_Write("INIT USART1 recue: role ESCLAVE, position 2\r\n");
+                    (void)snprintf(idText, sizeof(idText),
+                                   "INIT USART1 recue: role ESCLAVE, ID %lu\r\n",
+                                   (unsigned long)moduleId);
+                    Console_Write(idText);
                 }
 
                 /* L'ACK confirme la reception de la commande INIT au maitre. */
@@ -1149,6 +1164,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 moduleState = MODULE_UNINITIALIZED;
                 moduleIsMaster = false;
                 modulePosition = 0U;
+                moduleId = 0U;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
                 Console_Write("ACK RESET recu: etat local efface. Relance automatique de INIT.\r\n");
 
@@ -1156,7 +1172,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 initItem.message.header.command_type = CMD_INIT;
                 initItem.message.header.length = 1U;
                 initItem.message.header.reserve = 0U;
-                initItem.message.header.id_src = DEFAULT_ID;
+                initItem.message.header.id_src = moduleId;
                 initItem.message.payload[0] = 0U;
                 initItem.message.crc = 0U;
                 initItem.source = RX_SOURCE_PC;
@@ -1221,7 +1237,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             {
                 /* ID encode explicitement en little-endian, puis position et statut. */
                 uint8_t payload[6];
-                uint32_t id = DEFAULT_ID;
+                uint32_t id = moduleId;
 
                 payload[0] = (uint8_t)(id & 0xFFU);
                 payload[1] = (uint8_t)((id >> 8) & 0xFFU);
@@ -1360,6 +1376,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 moduleState = MODULE_UNINITIALIZED;
                 moduleIsMaster = false;
                 modulePosition = 0U;
+                moduleId = 0U;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
                 Console_Write("RESET recu: cle et etat local effaces.\r\n");
                 Protocol_SendUart1(CMD_ACK, NULL, 0U);
