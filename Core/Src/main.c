@@ -66,7 +66,8 @@ const osThreadAttr_t communicationTask_attributes = {
 const osThreadAttr_t protocolTask_attributes = {
     .name = "protocolTask",
     .stack_size = 512,
-    .priority = (osPriority_t) osPriorityNormal,
+    /* Prioritaire sur CommunicationTask pour traiter immediatement rxQueue. */
+    .priority = (osPriority_t) osPriorityAboveNormal,
 };
 
 const osThreadAttr_t securityTask_attributes = {
@@ -121,6 +122,7 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message);
 static void Protocol_ProcessMessage(const RxQueueItem_t *item);
 static void Console_ProcessLine(const char *line);
 static void Console_Write(const char *text);
+static void Console_WriteHexByte(uint8_t value);
 static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length);
 
 /* USER CODE BEGIN PFP */
@@ -444,6 +446,9 @@ void CommunicationTask(void *argument)
 {
     uint8_t rxByte;
     uint8_t frame[sizeof(ProtocolMessage_t)];
+    size_t frameIndex = 0U;
+    uint32_t lastFrameByteTick = 0U;
+
     char consoleLine[32];
     size_t consoleIndex = 0U;
     bool discardConsoleLine = false;
@@ -455,24 +460,37 @@ void CommunicationTask(void *argument)
 
     for (;;)
     {
-        /*
-         * USART1 : attendre le marqueur de debut, puis recevoir les 25 octets
-         * restants en un seul appel HAL afin d'eviter l'affichage octet par octet.
-         */
-        if (HAL_UART_Receive(&huart1, &rxByte, 1U, 1U) == HAL_OK)
+        /* Abandonner une trame partielle si aucun octet n'arrive pendant 20 ms. */
+        if ((frameIndex > 0U) &&
+            ((HAL_GetTick() - lastFrameByteTick) > 20U))
         {
-            if (rxByte == ICD_START_BYTE)
-            {
-                frame[0] = rxByte;
+            frameIndex = 0U;
+            Console_Write("\r\nERREUR: trame USART1 incomplete, abandonnee.\r\n");
+        }
 
-                if (HAL_UART_Receive(&huart1,
-                                     &frame[1],
-                                     (uint16_t)(sizeof(frame) - 1U),
-                                     20U) == HAL_OK)
+        /* USART1 : scrutation non bloquante, sans affichage pendant la reception. */
+        if (HAL_UART_Receive(&huart1, &rxByte, 1U, 0U) == HAL_OK)
+        {
+            if (frameIndex == 0U)
+            {
+                if (rxByte == ICD_START_BYTE)
+                {
+                    frame[0] = rxByte;
+                    frameIndex = 1U;
+                    lastFrameByteTick = HAL_GetTick();
+                }
+            }
+            else
+            {
+                frame[frameIndex++] = rxByte;
+                lastFrameByteTick = HAL_GetTick();
+
+                if (frameIndex == sizeof(frame))
                 {
                     RxQueueItem_t item = {0};
                     memcpy(&item.message, frame, sizeof(item.message));
                     item.source = RX_SOURCE_USART1;
+                    frameIndex = 0U;
 
                     Console_Write("\r\nTrame complete recue sur USART1 : ");
                     for (size_t i = 0U; i < sizeof(frame); i++)
@@ -481,26 +499,19 @@ void CommunicationTask(void *argument)
                     }
                     Console_Write("\r\n");
 
-                    if (Protocol_IsMessageValid(&item.message))
+                    if (!Protocol_IsMessageValid(&item.message))
                     {
-                        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
-                        {
-                            Console_Write("ERREUR: file RX pleine, trame perdue.\r\n");
-                        }
+                        Console_Write("ERREUR: trame invalide (entete, commande ou longueur).\r\n");
                     }
-                    else
+                    else if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
                     {
-                        Console_Write("ERREUR: trame invalide (entete ou longueur).\r\n");
+                        Console_Write("ERREUR: file RX pleine, trame perdue.\r\n");
                     }
-                }
-                else
-                {
-                    Console_Write("ERREUR: trame USART1 incomplete (26 octets attendus).\r\n");
                 }
             }
         }
 
-        /* USART2 : lire les caracteres du terminal PC sans bloquer l'attente USART1. */
+        /* USART2 : lire la console sans bloquer la reception USART1. */
         if (HAL_UART_Receive(&huart2, &rxByte, 1U, 0U) == HAL_OK)
         {
             if ((rxByte == '\r') || (rxByte == '\n'))
@@ -516,9 +527,6 @@ void CommunicationTask(void *argument)
             }
             else if (!discardConsoleLine)
             {
-                char echo[2] = {(char)rxByte, '\0'};
-                Console_Write(echo);
-
                 if (consoleIndex < (sizeof(consoleLine) - 1U))
                 {
                     consoleLine[consoleIndex++] = (char)rxByte;
@@ -532,7 +540,7 @@ void CommunicationTask(void *argument)
             }
         }
 
-        /* Pas de osDelay ici : la boucle doit sonder les UART rapidement. */
+        /* Pas de delai ici : la reception USART1 est scrutee en continu. */
     }
 }
 
@@ -540,36 +548,43 @@ static void Console_ProcessLine(const char *line)
 {
     RxQueueItem_t item = {0};
     char normalized[32];
-    size_t i = 0U;
     size_t start = 0U;
     size_t end;
+    size_t length;
+    size_t i;
 
     if (line == NULL)
     {
         return;
     }
 
-    /* Ignore les espaces au debut/fin et convertit la commande en majuscules. */
+    /* Retirer uniquement les espaces en debut/fin; conserver la casse du message. */
     while ((line[start] == ' ') || (line[start] == '\t'))
     {
         start++;
     }
-
     end = strlen(line);
     while ((end > start) &&
            ((line[end - 1U] == ' ') || (line[end - 1U] == '\t')))
     {
         end--;
     }
+    length = end - start;
 
-    while ((start < end) && (i < (sizeof(normalized) - 1U)))
+    if (length == 0U)
     {
-        char c = line[start++];
+        return;
+    }
+
+    /* Copie en majuscules uniquement pour reconnaitre I/INIT. */
+    for (i = 0U; (i < length) && (i < (sizeof(normalized) - 1U)); i++)
+    {
+        char c = line[start + i];
         if ((c >= 'a') && (c <= 'z'))
         {
             c = (char)(c - 'a' + 'A');
         }
-        normalized[i++] = c;
+        normalized[i] = c;
     }
     normalized[i] = '\0';
 
@@ -596,10 +611,38 @@ static void Console_ProcessLine(const char *line)
         {
             Console_Write("INIT ajoute a la file de traitement\r\n");
         }
+        return;
     }
-    else if (normalized[0] != '\0')
+
+    /* Toute autre ligne est un message texte, limite a la taille du payload ICD. */
+    if (length > MAX_PAYLOAD_SIZE)
     {
-        Console_Write("Commande inconnue. Envoyer I puis Entree.\r\n");
+        Console_Write("ERREUR: message trop long (maximum 16 caracteres).\r\n");
+        return;
+    }
+
+    if ((!moduleIsMaster) || (moduleState != MODULE_SYNCHRONIZED))
+    {
+        Console_Write("ERREUR: initialiser et synchroniser le maitre avant d'envoyer un message.\r\n");
+        return;
+    }
+
+    item.message.header.start_byte = ICD_START_BYTE;
+    item.message.header.command_type = CMD_MSG;
+    item.message.header.length = (uint8_t)length;
+    item.message.header.reserve = 0U;
+    item.message.header.id_src = DEFAULT_ID;
+    memcpy(item.message.payload, &line[start], length);
+    item.message.crc = 0U;
+    item.source = RX_SOURCE_PC;
+
+    if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+    {
+        Console_Write("ERREUR: file de traitement pleine, message non envoye.\r\n");
+    }
+    else
+    {
+        Console_Write("Message ajoute a la file de traitement.\r\n");
     }
 }
 
@@ -733,8 +776,32 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             break;
 
         case CMD_MSG:
-            Console_Write("Commande MESSAGE recue (traitement a implementer)\r\n");
+        {
+            if (item->source == RX_SOURCE_PC)
+            {
+                if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
+                {
+                    Protocol_SendUart1(CMD_MSG, message->payload,
+                                       message->header.length);
+                    Console_Write("Message transmis a la carte voisine.\r\n");
+                }
+                else
+                {
+                    Console_Write("ERREUR: transmission refusee, maitre non synchronise.\r\n");
+                }
+            }
+            else
+            {
+                char receivedText[MAX_PAYLOAD_SIZE + 1U];
+                uint8_t textLength = message->header.length;
+                memcpy(receivedText, message->payload, textLength);
+                receivedText[textLength] = '\0';
+                Console_Write("Message texte recu: ");
+                Console_Write(receivedText);
+                Console_Write("\r\n");
+            }
             break;
+        }
 
         case CMD_ERROR:
             Console_Write("Commande ERROR recue\r\n");
