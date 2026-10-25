@@ -22,6 +22,7 @@
 #include "protocol_icd.h"
 #include "string.h"
 #include <stdbool.h>
+#include<stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -44,6 +45,7 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* Definitions for defaultTask */
@@ -80,17 +82,46 @@ const osThreadAttr_t statusTask_attributes = {
 };
 /* USER CODE BEGIN PV */
 
+typedef enum
+{
+    RX_SOURCE_USART1 = 0, /* Trame recue depuis l'autre carte */
+    RX_SOURCE_PC = 1       /* Commande recue depuis le terminal USB */
+} RxSource_t;
+
+typedef struct
+{
+    ProtocolMessage_t message;
+    RxSource_t source;
+} RxQueueItem_t;
+
+typedef enum
+{
+    MODULE_UNINITIALIZED = 0,
+    MODULE_SYNCHRONIZING,
+    MODULE_SYNCHRONIZED
+} ModuleState_t;
+
+/* Ces informations sont propres a chaque carte et initialisees a l'execution. */
+static volatile ModuleState_t moduleState = MODULE_UNINITIALIZED;
+static volatile bool moduleIsMaster = false;
+static volatile uint8_t modulePosition = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 void CommunicationTask(void *argument);
 void ProtocolTask(void *argument);
 void SecurityTask(void *argument);
 void StatusTask(void *argument);
 static bool Protocol_IsMessageValid(const ProtocolMessage_t *message);
+static void Protocol_ProcessMessage(const RxQueueItem_t *item);
+static void Console_ProcessLine(const char *line);
+static void Console_Write(const char *text);
+static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length);
 
 /* USER CODE BEGIN PFP */
 
@@ -130,6 +161,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
@@ -152,7 +184,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
-  rxQueue = osMessageQueueNew(5, sizeof(ProtocolMessage_t), NULL);
+  rxQueue = osMessageQueueNew(5, sizeof(RxQueueItem_t), NULL);
 
   txQueue = osMessageQueueNew(5, sizeof(ProtocolMessage_t), NULL);
   /* USER CODE END RTOS_QUEUES */
@@ -241,6 +273,34 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
 static void MX_USART2_UART_Init(void)
 {
 
@@ -318,29 +378,228 @@ static void MX_GPIO_Init(void)
   */
 /* USER CODE END Header_StartDefaultTask */
 
-void CommunicationTask(void *argument)
+static void Console_Write(const char *text)
+{
+    if (text != NULL)
+    {
+        (void)HAL_UART_Transmit(&huart2, (uint8_t *)text,
+                                (uint16_t)strlen(text), 100U);
+    }
+}
+
+static void Console_WriteHexByte(uint8_t value)
+{
+    static const char hexDigits[] = "0123456789ABCDEF";
+    char output[4];
+
+    output[0] = hexDigits[(value >> 4) & 0x0F];
+    output[1] = hexDigits[value & 0x0F];
+    output[2] = ' ';
+    output[3] = '\0';
+
+    Console_Write(output);
+}
+
+static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length)
 {
     ProtocolMessage_t message = {0};
+    HAL_StatusTypeDef status;
+
+    if (length > MAX_PAYLOAD_SIZE)
+    {
+        Console_Write("ERREUR: payload trop long\r\n");
+        return;
+    }
+
+    message.header.start_byte = ICD_START_BYTE;
+    message.header.command_type = command;
+    message.header.length = length;
+    message.header.reserve = 0U;
+    message.header.id_src = DEFAULT_ID;
+
+    if ((payload != NULL) && (length > 0U))
+    {
+        memcpy(message.payload, payload, length);
+    }
+
+    /* CRC conserve a zero pour cette etape du projet. */
+    message.crc = 0U;
+
+    status = HAL_UART_Transmit(&huart1,
+                               (uint8_t *)&message,
+                               (uint16_t)sizeof(message),
+                               100U);
+
+    if (status == HAL_OK)
+    {
+        Console_Write("Trame envoyee sur USART1 (26 octets).\r\n");
+    }
+    else
+    {
+        Console_Write("ERREUR: echec transmission USART1.\r\n");
+    }
+}
+
+void CommunicationTask(void *argument)
+{
+    uint8_t rxByte;
+    uint8_t frame[sizeof(ProtocolMessage_t)];
+    char consoleLine[32];
+    size_t consoleIndex = 0U;
+    bool discardConsoleLine = false;
+
+    (void)argument;
+
+    Console_Write("Demarrage OK - USART1=liaison cartes, USART2=console PC\r\n");
+    Console_Write("Commande disponible: I puis Entree (ou INIT)\r\n");
 
     for (;;)
     {
-        /* Création d'une trame de test */
-        message.header.start_byte = ICD_START_BYTE;
-        message.header.command_type = CMD_MSG;
-        message.header.length = 5;
-        message.header.reserve = 0;
-        message.header.id_src = 1;
+        /*
+         * USART1 : attendre le marqueur de debut, puis recevoir les 25 octets
+         * restants en un seul appel HAL afin d'eviter l'affichage octet par octet.
+         */
+        if (HAL_UART_Receive(&huart1, &rxByte, 1U, 1U) == HAL_OK)
+        {
+            if (rxByte == ICD_START_BYTE)
+            {
+                frame[0] = rxByte;
 
-        message.payload[0] = 'H';
-        message.payload[1] = 'E';
-        message.payload[2] = 'L';
-        message.payload[3] = 'L';
-        message.payload[4] = 'O';
+                if (HAL_UART_Receive(&huart1,
+                                     &frame[1],
+                                     (uint16_t)(sizeof(frame) - 1U),
+                                     20U) == HAL_OK)
+                {
+                    RxQueueItem_t item = {0};
+                    memcpy(&item.message, frame, sizeof(item.message));
+                    item.source = RX_SOURCE_USART1;
 
-        /* Envoi vers ProtocolTask */
-        osMessageQueuePut(rxQueue, &message, 0, 0);
+                    Console_Write("\r\nTrame complete recue sur USART1 : ");
+                    for (size_t i = 0U; i < sizeof(frame); i++)
+                    {
+                        Console_WriteHexByte(frame[i]);
+                    }
+                    Console_Write("\r\n");
 
-        osDelay(1000);
+                    if (Protocol_IsMessageValid(&item.message))
+                    {
+                        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+                        {
+                            Console_Write("ERREUR: file RX pleine, trame perdue.\r\n");
+                        }
+                    }
+                    else
+                    {
+                        Console_Write("ERREUR: trame invalide (entete ou longueur).\r\n");
+                    }
+                }
+                else
+                {
+                    Console_Write("ERREUR: trame USART1 incomplete (26 octets attendus).\r\n");
+                }
+            }
+        }
+
+        /* USART2 : lire les caracteres du terminal PC sans bloquer l'attente USART1. */
+        if (HAL_UART_Receive(&huart2, &rxByte, 1U, 0U) == HAL_OK)
+        {
+            if ((rxByte == '\r') || (rxByte == '\n'))
+            {
+                if (!discardConsoleLine && (consoleIndex > 0U))
+                {
+                    consoleLine[consoleIndex] = '\0';
+                    Console_ProcessLine(consoleLine);
+                }
+
+                consoleIndex = 0U;
+                discardConsoleLine = false;
+            }
+            else if (!discardConsoleLine)
+            {
+                char echo[2] = {(char)rxByte, '\0'};
+                Console_Write(echo);
+
+                if (consoleIndex < (sizeof(consoleLine) - 1U))
+                {
+                    consoleLine[consoleIndex++] = (char)rxByte;
+                }
+                else
+                {
+                    consoleIndex = 0U;
+                    discardConsoleLine = true;
+                    Console_Write("\r\nERREUR: commande trop longue\r\n");
+                }
+            }
+        }
+
+        /* Pas de osDelay ici : la boucle doit sonder les UART rapidement. */
+    }
+}
+
+static void Console_ProcessLine(const char *line)
+{
+    RxQueueItem_t item = {0};
+    char normalized[32];
+    size_t i = 0U;
+    size_t start = 0U;
+    size_t end;
+
+    if (line == NULL)
+    {
+        return;
+    }
+
+    /* Ignore les espaces au debut/fin et convertit la commande en majuscules. */
+    while ((line[start] == ' ') || (line[start] == '\t'))
+    {
+        start++;
+    }
+
+    end = strlen(line);
+    while ((end > start) &&
+           ((line[end - 1U] == ' ') || (line[end - 1U] == '\t')))
+    {
+        end--;
+    }
+
+    while ((start < end) && (i < (sizeof(normalized) - 1U)))
+    {
+        char c = line[start++];
+        if ((c >= 'a') && (c <= 'z'))
+        {
+            c = (char)(c - 'a' + 'A');
+        }
+        normalized[i++] = c;
+    }
+    normalized[i] = '\0';
+
+    Console_Write("\r\nCommande recue: ");
+    Console_Write(normalized);
+    Console_Write("\r\n");
+
+    if ((strcmp(normalized, "I") == 0) || (strcmp(normalized, "INIT") == 0))
+    {
+        item.message.header.start_byte = ICD_START_BYTE;
+        item.message.header.command_type = CMD_INIT;
+        item.message.header.length = 1U;
+        item.message.header.reserve = 0U;
+        item.message.header.id_src = DEFAULT_ID;
+        item.message.payload[0] = 0U; /* INIT = 0 selon l'ICD */
+        item.message.crc = 0U;
+        item.source = RX_SOURCE_PC;
+
+        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+        {
+            Console_Write("ERREUR: impossible de mettre INIT en file\r\n");
+        }
+        else
+        {
+            Console_Write("INIT ajoute a la file de traitement\r\n");
+        }
+    }
+    else if (normalized[0] != '\0')
+    {
+        Console_Write("Commande inconnue. Envoyer I puis Entree.\r\n");
     }
 }
 
@@ -351,134 +610,176 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
         return false;
     }
 
-    /* Verification de l'octet de debut */
+    /* Verifications structurelles communes a toutes les commandes. */
     if (message->header.start_byte != ICD_START_BYTE)
     {
         return false;
     }
 
-    /* Verification de la longueur du payload */
+    if (message->header.reserve != 0U)
+    {
+        return false;
+    }
+
     if (message->header.length > MAX_PAYLOAD_SIZE)
     {
         return false;
     }
 
+    /* Refuser les valeurs de commande qui ne sont pas definies dans l'ICD. */
+    if ((message->header.command_type != CMD_INIT)  &&
+        (message->header.command_type != CMD_RESET) &&
+        (message->header.command_type != CMD_ACK)   &&
+        (message->header.command_type != CMD_MSG)   &&
+        (message->header.command_type != CMD_ERROR))
+    {
+        return false;
+    }
+
+    /* Verifications propres aux commandes deja utilisees par le test. */
+    if (message->header.command_type == CMD_INIT)
+    {
+        if ((message->header.length != 1U) || (message->payload[0] != 0U))
+        {
+            return false;
+        }
+    }
+    else if (message->header.command_type == CMD_ACK)
+    {
+        if (message->header.length != 0U)
+        {
+            return false;
+        }
+    }
+
+    /* Le CRC est encore fixe a zero dans cette version et n'est pas verifie. */
     return true;
 }
 
-static void Protocol_ProcessMessage(const ProtocolMessage_t *message)
+static void Protocol_ProcessMessage(const RxQueueItem_t *item)
 {
+    const ProtocolMessage_t *message;
+
+    if (item == NULL)
+    {
+        return;
+    }
+    message = &item->message;
+
     switch (message->header.command_type)
     {
-        case CMD_MSG:
+        case CMD_INIT:
         {
-            if (message->header.length == 5 &&
-                memcmp(message->payload, "HELLO", 5) == 0)
+            if ((message->header.length < 1U) || (message->payload[0] != 0U))
             {
-                const char *msg = "Trame HELLO recue\r\n";
+                Console_Write("INIT ignore: payload invalide\r\n");
+                break;
+            }
 
-                HAL_UART_Transmit(
-                    &huart2,
-                    (uint8_t *)msg,
-                    strlen(msg),
-                    HAL_MAX_DELAY
-                );
+            if (item->source == RX_SOURCE_PC)
+            {
+                /* Une commande INIT saisie sur le PC designe cette carte comme maitre. */
+                if (moduleState == MODULE_UNINITIALIZED)
+                {
+                    moduleIsMaster = true;
+                    modulePosition = 1U;
+                    moduleState = MODULE_SYNCHRONIZING;
+                    Console_Write("INIT PC recue: role MAITRE, position 1\r\n");
+                    Console_Write("INIT transmis a la carte voisine; attente ACK\r\n");
+                    Protocol_SendUart1(CMD_INIT, message->payload, 1U);
+                }
+                else if (moduleIsMaster)
+                {
+                    Console_Write("Carte deja initialisee comme MAITRE\r\n");
+                }
+                else
+                {
+                    Console_Write("INIT refuse: carte deja initialisee comme ESCLAVE\r\n");
+                }
             }
             else
             {
-                const char *msg = "Payload CMD_MSG invalide\r\n";
+                /* INIT venant de la carte precedente: cette carte devient esclave. */
+                if (moduleState == MODULE_UNINITIALIZED)
+                {
+                    moduleIsMaster = false;
+                    modulePosition = 2U; /* Topologie de test a deux cartes. */
+                    moduleState = MODULE_SYNCHRONIZED;
+                    Console_Write("INIT USART1 recue: role ESCLAVE, position 2\r\n");
+                }
 
-                HAL_UART_Transmit(
-                    &huart2,
-                    (uint8_t *)msg,
-                    strlen(msg),
-                    HAL_MAX_DELAY
-                );
+                /* L'ACK confirme la reception de la commande INIT au maitre. */
+                Protocol_SendUart1(CMD_ACK, NULL, 0U);
+                Console_Write("ACK renvoye au maitre\r\n");
             }
             break;
         }
 
-        case CMD_INIT:
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)"Commande INIT recue\r\n",
-                strlen("Commande INIT recue\r\n"),
-                HAL_MAX_DELAY
-            );
+        case CMD_ACK:
+            if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZING))
+            {
+                moduleState = MODULE_SYNCHRONIZED;
+                HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+                Console_Write("ACK recu: chaine synchronisee (test 2 cartes)\r\n");
+            }
+            else
+            {
+                Console_Write("ACK recu\r\n");
+            }
             break;
 
         case CMD_RESET:
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)"Commande RESET recue\r\n",
-                strlen("Commande RESET recue\r\n"),
-                HAL_MAX_DELAY
-            );
+            Console_Write("Commande RESET recue (traitement a implementer)\r\n");
             break;
 
-        case CMD_ACK:
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)"Commande ACK recue\r\n",
-                strlen("Commande ACK recue\r\n"),
-                HAL_MAX_DELAY
-            );
+        case CMD_MSG:
+            Console_Write("Commande MESSAGE recue (traitement a implementer)\r\n");
             break;
 
         case CMD_ERROR:
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)"Commande ERROR recue\r\n",
-                strlen("Commande ERROR recue\r\n"),
-                HAL_MAX_DELAY
-            );
+            Console_Write("Commande ERROR recue\r\n");
             break;
 
         default:
-            HAL_UART_Transmit(
-                &huart2,
-                (uint8_t *)"Type de commande inconnu\r\n",
-                strlen("Type de commande inconnu\r\n"),
-                HAL_MAX_DELAY
-            );
+            Console_Write("Type de commande inconnu\r\n");
             break;
     }
 }
 
-
 void ProtocolTask(void *argument)
 {
-    ProtocolMessage_t message;
+    RxQueueItem_t item;
+    (void)argument;
 
-for (;;)
-{
-    if (osMessageQueueGet(rxQueue, &message, NULL, osWaitForever) == osOK)
+    for (;;)
     {
-        if (!Protocol_IsMessageValid(&message))
+        if (osMessageQueueGet(rxQueue, &item, NULL, osWaitForever) == osOK)
         {
-            continue;
+            if (Protocol_IsMessageValid(&item.message))
+            {
+                Protocol_ProcessMessage(&item);
+            }
         }
-
-        Protocol_ProcessMessage(&message);
     }
 }
-}
+
 void SecurityTask(void *argument)
 {
+    (void)argument;
     for (;;)
     {
-        // Gestion de la sécurité
-
-        osDelay(1);
+        /* La generation et la distribution de cle seront ajoutees a l'etape suivante. */
+        osDelay(10U);
     }
 }
+
 void StatusTask(void *argument)
 {
+    (void)argument;
     for (;;)
     {
-        // Mise à jour de l'état
-
-        osDelay(1);
+        /* La gestion complete des indicateurs sera ajoutee plus tard. */
+        osDelay(10U);
     }
 }
 
