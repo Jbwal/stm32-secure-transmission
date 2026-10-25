@@ -150,7 +150,6 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message);
 static void Protocol_ProcessMessage(const RxQueueItem_t *item);
 static void Console_ProcessLine(const char *line);
 static void Console_Write(const char *text);
-static void Console_WriteHexByte(uint8_t value);
 static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length);
 static uint32_t Protocol_GenerateKey32(void);
 static void Protocol_XorCrypt(uint8_t *data, uint8_t length, uint32_t key);
@@ -424,19 +423,6 @@ static void Console_Write(const char *text)
     }
 }
 
-static void Console_WriteHexByte(uint8_t value)
-{
-    static const char hexDigits[] = "0123456789ABCDEF";
-    char output[4];
-
-    output[0] = hexDigits[(value >> 4) & 0x0F];
-    output[1] = hexDigits[value & 0x0F];
-    output[2] = ' ';
-    output[3] = '\0';
-
-    Console_Write(output);
-}
-
 static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length)
 {
     ProtocolMessage_t message = {0};
@@ -467,13 +453,9 @@ static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t 
                                (uint16_t)sizeof(message),
                                100U);
 
-    if (status == HAL_OK)
+    if (status != HAL_OK)
     {
-        Console_Write("Trame envoyee sur USART1 (26 octets).\r\n");
-    }
-    else
-    {
-        Console_Write("ERREUR: echec transmission USART1.\r\n");
+        Console_Write("[ERREUR] Echec de transmission vers la carte voisine.\r\n");
     }
 }
 
@@ -543,20 +525,10 @@ void CommunicationTask(void *argument)
             }
         }
 
-        /* Diagnostic si une trame commence mais ne se termine pas. */
+        /* Une trame incomplete est ignoree sans afficher son contenu brut. */
         if ((frameIndex > 0U) && ((HAL_GetTick() - lastFrameByteTick) > 100U))
         {
-            char debugMessage[96];
-            (void)snprintf(debugMessage, sizeof(debugMessage),
-                           "\r\nERREUR: trame USART1 incomplete, %lu/%lu octets recus.\r\n",
-                           (unsigned long)frameIndex, (unsigned long)sizeof(frame));
-            Console_Write(debugMessage);
-            Console_Write("Debut de trame: ");
-            for (size_t i = 0U; (i < frameIndex) && (i < 8U); i++)
-            {
-                Console_WriteHexByte(frame[i]);
-            }
-            Console_Write("\r\n");
+            Console_Write("[ERREUR] Message incomplet ignore.\r\n");
             frameIndex = 0U;
         }
 
@@ -610,7 +582,7 @@ void CommunicationTask(void *argument)
 
             if (osMessageQueuePut(rxQueue, &buttonItem, 0U, 0U) == osOK)
             {
-                Console_Write("\r\nTriple appui USER detecte: reinitialisation demandee.\r\n");
+                Console_Write("\r\n[RESET] Triple appui detecte ; reinitialisation demandee.\r\n");
             }
             else
             {
@@ -839,9 +811,7 @@ static void Console_ProcessLine(const char *line)
         return;
     }
 
-    Console_Write("\r\nCommande recue: ");
-    Console_Write(normalized);
-    Console_Write("\r\n");
+    /* Les logs detailles sont emis par le traitement de chaque commande. */
 
     if (strcmp(normalized, "REINITIALISATION") == 0)
     {
@@ -860,7 +830,7 @@ static void Console_ProcessLine(const char *line)
         }
         else
         {
-            Console_Write("Commande REINITIALISATION ajoutee a la file.\r\n");
+            Console_Write("[RESET] Demande prise en compte.\r\n");
         }
         return;
     }
@@ -882,7 +852,7 @@ static void Console_ProcessLine(const char *line)
         }
         else
         {
-            Console_Write("INIT ajoute a la file de traitement\r\n");
+            Console_Write("[INIT] Initialisation demandee.\r\n");
         }
         return;
     }
@@ -910,7 +880,7 @@ static void Console_ProcessLine(const char *line)
         }
         else
         {
-            Console_Write("Demande GET_INFO ajoutee a la file de traitement.\r\n");
+            Console_Write("[INFO] Demande d'informations en cours.\r\n");
         }
         return;
     }
@@ -941,7 +911,7 @@ static void Console_ProcessLine(const char *line)
         }
 
         (void)snprintf(info, sizeof(info),
-                       "\r\n--- INFORMATIONS DU MODULE ---\r\n"
+                       "\r\n[INFO] ETAT DE LA CARTE\r\n"
                        "Identifiant: %lu\r\n"
                        "Role: %s\r\n"
                        "Position: %u\r\n"
@@ -956,7 +926,7 @@ static void Console_ProcessLine(const char *line)
     /* Toute autre ligne est un message texte, limite a la taille du payload ICD. */
     if (length > MAX_PAYLOAD_SIZE)
     {
-        Console_Write("ERREUR: message trop long (maximum 16 caracteres).\r\n");
+        Console_Write("[ERREUR] Message trop long (16 caracteres maximum).\r\n");
         return;
     }
 
@@ -990,11 +960,11 @@ static void Console_ProcessLine(const char *line)
 
     if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
     {
-        Console_Write("ERREUR: file de traitement pleine, message non envoye.\r\n");
+        Console_Write("[ERREUR] File de traitement pleine ; message non envoye.\r\n");
     }
     else
     {
-        Console_Write("Message ajoute a la file de traitement.\r\n");
+        Console_Write("[MESSAGE] Envoi en cours de traitement.\r\n");
     }
 }
 
@@ -1110,8 +1080,8 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                     moduleState = MODULE_SYNCHRONIZING;
                     {
                         uint8_t assignedId = 2U;
-                        Console_Write("INIT PC recue: role MAITRE, ID 1\r\n");
-                        Console_Write("INIT transmis a la carte voisine avec attribution de l'ID 2; attente ACK\r\n");
+                        Console_Write("[INIT 1/4] Carte configuree en MAITRE (ID 1).\r\n");
+                        Console_Write("[INIT 2/4] Attribution de l'ID 2 ; attente de confirmation.\r\n");
                         Protocol_SendUart1(CMD_INIT, &assignedId, 1U);
                     }
                 }
@@ -1140,14 +1110,14 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                     modulePosition = message->payload[0];
                     moduleState = MODULE_SYNCHRONIZED;
                     (void)snprintf(idText, sizeof(idText),
-                                   "INIT USART1 recue: role ESCLAVE, ID %lu\r\n",
+                                   "[INIT] Carte configuree en ESCLAVE (ID %lu).\r\n",
                                    (unsigned long)moduleId);
                     Console_Write(idText);
                 }
 
                 /* L'ACK confirme la reception de la commande INIT au maitre. */
                 Protocol_SendUart1(CMD_ACK, NULL, 0U);
-                Console_Write("ACK renvoye au maitre\r\n");
+                Console_Write("[INIT] Confirmation envoyee au maitre.\r\n");
             }
             break;
         }
@@ -1166,7 +1136,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 modulePosition = 0U;
                 moduleId = 0U;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-                Console_Write("ACK RESET recu: etat local efface. Relance automatique de INIT.\r\n");
+                Console_Write("[RESET] Confirmation recue ; relance automatique de l'initialisation.\r\n");
 
                 initItem.message.header.start_byte = ICD_START_BYTE;
                 initItem.message.header.command_type = CMD_INIT;
@@ -1186,7 +1156,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             else if (moduleIsMaster && keyUpdatePending)
             {
                 keyUpdatePending = false;
-                Console_Write("ACK recu: cle mise a jour sur la carte esclave.\r\n");
+                Console_Write("[CLE] Confirmation : cle enregistree sur la carte esclave.\r\n");
             }
             else if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZING))
             {
@@ -1195,7 +1165,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
 
                 moduleState = MODULE_SYNCHRONIZED;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
-                Console_Write("ACK recu: chaine synchronisee (test 2 cartes)\r\n");
+                Console_Write("[INIT 3/4] Liaison avec la carte voisine synchronisee.\r\n");
 
                 /* Apres l'ACK d'INIT, generation et distribution automatiques de la cle. */
                 moduleKey = Protocol_GenerateKey32();
@@ -1205,13 +1175,13 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 payload[3] = (uint8_t)((moduleKey >> 24) & 0xFFU);
 
                 (void)snprintf(keyText, sizeof(keyText),
-                               "INIT termine: cle 32 bits generee: 0x%08lX\r\n",
+                               "[CLE 1/2] Cle de session generee : 0x%08lX\r\n",
                                (unsigned long)moduleKey);
                 Console_Write(keyText);
 
                 keyUpdatePending = true;
                 Protocol_SendUart1(CMD_UPDT_KEY, payload, 4U);
-                Console_Write("Cle envoyee automatiquement a la carte esclave; attente ACK.\r\n");
+                Console_Write("[CLE 2/2] Cle transmise ; attente de confirmation.\r\n");
             }
             else
             {
@@ -1226,7 +1196,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
                 {
                     Protocol_SendUart1(CMD_GET_INFO, NULL, 0U);
-                    Console_Write("Demande GET_INFO transmise a la carte esclave.\r\n");
+                    Console_Write("[INFO] Demande transmise a la carte esclave.\r\n");
                 }
                 else
                 {
@@ -1247,7 +1217,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 payload[5] = (uint8_t)moduleState;
 
                 Protocol_SendUart1(CMD_INFO_RESPONSE, payload, 6U);
-                Console_Write("Reponse GET_INFO envoyee au maitre.\r\n");
+                Console_Write("[INFO] Informations transmises au maitre.\r\n");
             }
             break;
         }
@@ -1266,13 +1236,13 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 {
                     char keyText[96];
                     (void)snprintf(keyText, sizeof(keyText),
-                                   "Cle recue et stockee sur l'esclave: 0x%08lX\r\n",
+                                   "[CLE] Cle de session recue et enregistree.\r\n",
                                    (unsigned long)moduleKey);
                     Console_Write(keyText);
                 }
 
                 Protocol_SendUart1(CMD_ACK, NULL, 0U);
-                Console_Write("ACK renvoye apres mise a jour de la cle.\r\n");
+                Console_Write("[CLE] Confirmation de reception envoyee au maitre.\r\n");
             }
             else
             {
@@ -1315,7 +1285,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 {
                     char info[160];
                     (void)snprintf(info, sizeof(info),
-                                   "\r\n--- INFORMATIONS DE L'ESCLAVE ---\r\n"
+                                   "\r\n[INFO] ETAT DE LA CARTE ESCLAVE\r\n"
                                    "Identifiant: %lu\r\n"
                                    "Position: %u\r\n"
                                    "Statut: %s\r\n"
@@ -1350,13 +1320,13 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                     resetPending = true;
                     resetMode = 0U;
                     Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
-                    Console_Write("REINITIALISATION envoyee a l'esclave; attente ACK.\r\n");
+                    Console_Write("[RESET] Demande transmise ; attente de confirmation.\r\n");
                 }
                 else
                 {
                     resetMode = 1U;
                     Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
-                    Console_Write("Demande de reinitialisation envoyee au maitre.\r\n");
+                    Console_Write("[RESET] Demande transmise au maitre.\r\n");
                 }
             }
             else if (moduleIsMaster && (resetMode == 1U))
@@ -1366,7 +1336,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                     resetPending = true;
                     resetMode = 0U;
                     Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
-                    Console_Write("Demande RESET de l'esclave: reinitialisation coordonnee lancee.\r\n");
+                    Console_Write("[RESET] Reinitialisation coordonnee demandee par l'esclave.\r\n");
                 }
             }
             else if ((!moduleIsMaster) && (resetMode == 0U))
@@ -1378,9 +1348,9 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 modulePosition = 0U;
                 moduleId = 0U;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-                Console_Write("RESET recu: cle et etat local effaces.\r\n");
+                Console_Write("[RESET] Etat local et cle effaces.\r\n");
                 Protocol_SendUart1(CMD_ACK, NULL, 0U);
-                Console_Write("ACK RESET envoye au maitre.\r\n");
+                Console_Write("[RESET] Confirmation envoyee au maitre.\r\n");
             }
             else
             {
@@ -1397,7 +1367,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 {
                     Protocol_SendUart1(CMD_MSG, message->payload,
                                        message->header.length);
-                    Console_Write("Message transmis a la carte voisine.\r\n");
+                    Console_Write("[MESSAGE] Message chiffre transmis a la carte voisine.\r\n");
                 }
                 else
                 {
@@ -1421,7 +1391,7 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
                 memcpy(receivedText, decryptedPayload, textLength);
                 receivedText[textLength] = '\0';
 
-                Console_Write("Message dechiffre recu: ");
+                Console_Write("[MESSAGE] Texte dechiffre recu : ");
                 Console_Write(receivedText);
                 Console_Write("\r\n");
             }
@@ -1447,23 +1417,13 @@ void ProtocolTask(void *argument)
     {
         if (osMessageQueueGet(rxQueue, &item, NULL, osWaitForever) == osOK)
         {
-            if (item.source == RX_SOURCE_USART1)
-            {
-                Console_Write("\r\nTrame complete recue sur USART1 : ");
-                for (size_t i = 0U; i < sizeof(ProtocolMessage_t); i++)
-                {
-                    Console_WriteHexByte(((const uint8_t *)&item.message)[i]);
-                }
-                Console_Write("\r\n");
-            }
-
             if (Protocol_IsMessageValid(&item.message))
             {
                 Protocol_ProcessMessage(&item);
             }
             else
             {
-                Console_Write("ERREUR TRAME: commande invalide ou champs incoherents.\r\n");
+                Console_Write("[ERREUR] Message recu invalide ; message ignore.\r\n");
             }
         }
     }
@@ -1474,18 +1434,39 @@ void SecurityTask(void *argument)
     (void)argument;
     for (;;)
     {
-        /* La generation et la distribution de cle seront ajoutees a l'etape suivante. */
+        /* La securite est geree par les fonctions de protocole et de chiffrement. */
         osDelay(10U);
     }
 }
 
 void StatusTask(void *argument)
 {
+    GPIO_PinState ledState = GPIO_PIN_RESET;
+
     (void)argument;
+
+    /*
+     * LED d'etat :
+     * - module non synchronise (non initialise ou synchronisation en cours) :
+     *   clignotement toutes les 500 ms ;
+     * - module synchronise : LED allumee en continu.
+     *
+     * Cette tache est le gestionnaire principal de la LED.
+     */
     for (;;)
     {
-        /* La gestion complete des indicateurs sera ajoutee plus tard. */
-        osDelay(10U);
+        if (moduleState == MODULE_SYNCHRONIZED)
+        {
+            ledState = GPIO_PIN_SET;
+            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+            osDelay(100U);
+        }
+        else
+        {
+            ledState = (ledState == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, ledState);
+            osDelay(500U);
+        }
     }
 }
 
