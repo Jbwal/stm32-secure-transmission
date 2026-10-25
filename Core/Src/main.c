@@ -111,6 +111,13 @@ static volatile uint8_t modulePosition = 0U;
 static uint32_t moduleKey = 0U;
 static volatile bool keyUpdatePending = false;
 
+/* Reinitialisation coordonnee et triple-clic sur le bouton USER. */
+static volatile bool resetPending = false;
+static volatile bool buttonResetRequested = false;
+static volatile uint8_t userButtonPressCount = 0U;
+static volatile uint32_t userButtonFirstPressTick = 0U;
+static volatile uint32_t userButtonLastPressTick = 0U;
+
 /* Reception USART1 et USART2 par interruption avec buffers circulaires. */
 #define UART1_RX_RING_SIZE 128U
 #define UART2_RX_RING_SIZE 128U
@@ -145,6 +152,7 @@ static void Console_Write(const char *text);
 static void Console_WriteHexByte(uint8_t value);
 static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length);
 static uint32_t Protocol_GenerateKey32(void);
+static void Protocol_XorCrypt(uint8_t *data, uint8_t length, uint32_t key);
 
 /* USER CODE BEGIN PFP */
 
@@ -482,7 +490,7 @@ void CommunicationTask(void *argument)
     (void)argument;
 
     Console_Write("Demarrage OK - USART1=interruptions, USART2=console PC\r\n");
-    Console_Write("Commandes: INIT, INFO, GET_INFO, GET_KEY, puis texte (max 16 octets)\r\n");
+    Console_Write("Commandes: INIT, REINITIALISATION, INFO, GET_INFO, GET_KEY, texte (max 16 octets)\r\n");
 
     /* Demarrer les receptions interruptives sur les deux UART. */
     rxStatus = HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U);
@@ -585,6 +593,30 @@ void CommunicationTask(void *argument)
             }
         }
 
+        /* Convertir le triple-clic en commande protocolaire hors interruption. */
+        if (buttonResetRequested)
+        {
+            RxQueueItem_t buttonItem = {0};
+            buttonResetRequested = false;
+            buttonItem.message.header.start_byte = ICD_START_BYTE;
+            buttonItem.message.header.command_type = CMD_RESET;
+            buttonItem.message.header.length = 1U;
+            buttonItem.message.header.reserve = 0U;
+            buttonItem.message.header.id_src = DEFAULT_ID;
+            buttonItem.message.payload[0] = 0U;
+            buttonItem.message.crc = 0U;
+            buttonItem.source = RX_SOURCE_PC;
+
+            if (osMessageQueuePut(rxQueue, &buttonItem, 0U, 0U) == osOK)
+            {
+                Console_Write("\r\nTriple appui USER detecte: reinitialisation demandee.\r\n");
+            }
+            else
+            {
+                Console_Write("\r\nERREUR: file RX pleine; reinitialisation non lancee.\r\n");
+            }
+        }
+
         osDelay(1U);
     }
 }
@@ -633,6 +665,47 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
+/*
+ * Triple pression sur USER en moins de 1,5 s.
+ * La callback ne fait que compter les appuis; le protocole est traite
+ * ensuite dans CommunicationTask, hors interruption.
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    uint32_t now;
+
+    if (GPIO_Pin != USER_BUTTON_Pin)
+    {
+        return;
+    }
+
+    now = HAL_GetTick();
+    if ((userButtonLastPressTick != 0U) &&
+        ((now - userButtonLastPressTick) < 180U))
+    {
+        return; /* anti-rebond */
+    }
+    userButtonLastPressTick = now;
+
+    if ((userButtonPressCount == 0U) ||
+        ((now - userButtonFirstPressTick) > 1500U))
+    {
+        userButtonPressCount = 1U;
+        userButtonFirstPressTick = now;
+    }
+    else
+    {
+        userButtonPressCount++;
+    }
+
+    if (userButtonPressCount >= 3U)
+    {
+        buttonResetRequested = true;
+        userButtonPressCount = 0U;
+        userButtonFirstPressTick = 0U;
+    }
+}
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if ((huart != NULL) && (huart->Instance == USART1))
@@ -676,6 +749,27 @@ static uint32_t Protocol_GenerateKey32(void)
     }
 
     return state;
+}
+
+/*
+ * Chiffrement pedagogique XOR avec reutilisation des 4 octets de la cle.
+ * Attention : ce mecanisme n'est pas un chiffrement securise.
+ * Appliquer deux fois la meme operation retrouve les octets d'origine.
+ */
+static void Protocol_XorCrypt(uint8_t *data, uint8_t length, uint32_t key)
+{
+    uint8_t keyBytes[4];
+    uint8_t i;
+
+    keyBytes[0] = (uint8_t)(key & 0xFFU);
+    keyBytes[1] = (uint8_t)((key >> 8) & 0xFFU);
+    keyBytes[2] = (uint8_t)((key >> 16) & 0xFFU);
+    keyBytes[3] = (uint8_t)((key >> 24) & 0xFFU);
+
+    for (i = 0U; i < length; i++)
+    {
+        data[i] ^= keyBytes[i % 4U];
+    }
 }
 
 static void Console_ProcessLine(const char *line)
@@ -722,9 +816,53 @@ static void Console_ProcessLine(const char *line)
     }
     normalized[i] = '\0';
 
+    /*
+     * GET_KEY affiche uniquement la cle deja generee pendant INIT.
+     * Ne pas regenerer la cle ici : les deux cartes doivent conserver
+     * la meme cle pour que le dechiffrement continue de fonctionner.
+     */
+    if (strcmp(normalized, "GET_KEY") == 0)
+    {
+        char keyText[16];
+
+        if ((!moduleIsMaster) || (moduleState != MODULE_SYNCHRONIZED) ||
+            (moduleKey == 0U))
+        {
+            Console_Write("ERREUR: aucune cle disponible; lancez INIT d'abord.\r\n");
+            return;
+        }
+
+        (void)snprintf(keyText, sizeof(keyText), "0x%08lX\r\n",
+                       (unsigned long)moduleKey);
+        Console_Write(keyText);
+        return;
+    }
+
     Console_Write("\r\nCommande recue: ");
     Console_Write(normalized);
     Console_Write("\r\n");
+
+    if (strcmp(normalized, "REINITIALISATION") == 0)
+    {
+        item.message.header.start_byte = ICD_START_BYTE;
+        item.message.header.command_type = CMD_RESET;
+        item.message.header.length = 1U;
+        item.message.header.reserve = 0U;
+        item.message.header.id_src = DEFAULT_ID;
+        item.message.payload[0] = 0U;
+        item.message.crc = 0U;
+        item.source = RX_SOURCE_PC;
+
+        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+        {
+            Console_Write("ERREUR: impossible de mettre REINITIALISATION en file.\r\n");
+        }
+        else
+        {
+            Console_Write("Commande REINITIALISATION ajoutee a la file.\r\n");
+        }
+        return;
+    }
 
     if ((strcmp(normalized, "I") == 0) || (strcmp(normalized, "INIT") == 0))
     {
@@ -772,34 +910,6 @@ static void Console_ProcessLine(const char *line)
         else
         {
             Console_Write("Demande GET_INFO ajoutee a la file de traitement.\r\n");
-        }
-        return;
-    }
-
-    /* GET_KEY : demande au maitre de generer une cle 32 bits et de la distribuer. */
-    if (strcmp(normalized, "GET_KEY") == 0)
-    {
-        if ((!moduleIsMaster) || (moduleState != MODULE_SYNCHRONIZED))
-        {
-            Console_Write("ERREUR: GET_KEY necessite un maitre initialise et synchronise.\r\n");
-            return;
-        }
-
-        item.message.header.start_byte = ICD_START_BYTE;
-        item.message.header.command_type = CMD_GET_KEY;
-        item.message.header.length = 0U;
-        item.message.header.reserve = 0U;
-        item.message.header.id_src = DEFAULT_ID;
-        item.message.crc = 0U;
-        item.source = RX_SOURCE_PC;
-
-        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
-        {
-            Console_Write("ERREUR: impossible de mettre GET_KEY en file\r\n");
-        }
-        else
-        {
-            Console_Write("Demande GET_KEY ajoutee a la file de traitement.\r\n");
         }
         return;
     }
@@ -861,6 +971,19 @@ static void Console_ProcessLine(const char *line)
     item.message.header.reserve = 0U;
     item.message.header.id_src = DEFAULT_ID;
     memcpy(item.message.payload, &line[start], length);
+
+    /*
+     * Le maitre chiffre le texte avant de le placer dans la file.
+     * Le test de cle non nulle evite d'envoyer un message chiffre avec une
+     * cle qui n'a pas encore ete distribuee.
+     */
+    if (moduleKey == 0U)
+    {
+        Console_Write("ERREUR: aucune cle disponible. Lancez GET_KEY avant d'envoyer un message.\r\n");
+        return;
+    }
+    Protocol_XorCrypt(item.message.payload, (uint8_t)length, moduleKey);
+
     item.message.crc = 0U;
     item.source = RX_SOURCE_PC;
 
@@ -924,6 +1047,13 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
              (message->header.command_type == CMD_GET_KEY))
     {
         if (message->header.length != 0U)
+        {
+            return false;
+        }
+    }
+    else if (message->header.command_type == CMD_RESET)
+    {
+        if ((message->header.length != 1U) || (message->payload[0] > 1U))
         {
             return false;
         }
@@ -1008,17 +1138,64 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
         }
 
         case CMD_ACK:
+            /* ACK de RESET: effacer l'etat local puis relancer INIT automatiquement. */
+            if (moduleIsMaster && resetPending)
+            {
+                RxQueueItem_t initItem = {0};
+
+                resetPending = false;
+                keyUpdatePending = false;
+                moduleKey = 0U;
+                moduleState = MODULE_UNINITIALIZED;
+                moduleIsMaster = false;
+                modulePosition = 0U;
+                HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+                Console_Write("ACK RESET recu: etat local efface. Relance automatique de INIT.\r\n");
+
+                initItem.message.header.start_byte = ICD_START_BYTE;
+                initItem.message.header.command_type = CMD_INIT;
+                initItem.message.header.length = 1U;
+                initItem.message.header.reserve = 0U;
+                initItem.message.header.id_src = DEFAULT_ID;
+                initItem.message.payload[0] = 0U;
+                initItem.message.crc = 0U;
+                initItem.source = RX_SOURCE_PC;
+
+                if (osMessageQueuePut(rxQueue, &initItem, 0U, 0U) != osOK)
+                {
+                    Console_Write("ERREUR: RESET termine, mais INIT automatique n'a pas pu etre mis en file.\r\n");
+                }
+            }
             /* Priorite a l'ACK attendu pour UPDT_KEY. */
-            if (moduleIsMaster && keyUpdatePending)
+            else if (moduleIsMaster && keyUpdatePending)
             {
                 keyUpdatePending = false;
                 Console_Write("ACK recu: cle mise a jour sur la carte esclave.\r\n");
             }
             else if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZING))
             {
+                uint8_t payload[4];
+                char keyText[96];
+
                 moduleState = MODULE_SYNCHRONIZED;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
                 Console_Write("ACK recu: chaine synchronisee (test 2 cartes)\r\n");
+
+                /* Apres l'ACK d'INIT, generation et distribution automatiques de la cle. */
+                moduleKey = Protocol_GenerateKey32();
+                payload[0] = (uint8_t)(moduleKey & 0xFFU);
+                payload[1] = (uint8_t)((moduleKey >> 8) & 0xFFU);
+                payload[2] = (uint8_t)((moduleKey >> 16) & 0xFFU);
+                payload[3] = (uint8_t)((moduleKey >> 24) & 0xFFU);
+
+                (void)snprintf(keyText, sizeof(keyText),
+                               "INIT termine: cle 32 bits generee: 0x%08lX\r\n",
+                               (unsigned long)moduleKey);
+                Console_Write(keyText);
+
+                keyUpdatePending = true;
+                Protocol_SendUart1(CMD_UPDT_KEY, payload, 4U);
+                Console_Write("Cle envoyee automatiquement a la carte esclave; attente ACK.\r\n");
             }
             else
             {
@@ -1055,36 +1232,6 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
 
                 Protocol_SendUart1(CMD_INFO_RESPONSE, payload, 6U);
                 Console_Write("Reponse GET_INFO envoyee au maitre.\r\n");
-            }
-            break;
-        }
-
-        case CMD_GET_KEY:
-        {
-            if ((item->source == RX_SOURCE_PC) &&
-                moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
-            {
-                char keyText[96];
-                uint8_t payload[4];
-
-                moduleKey = Protocol_GenerateKey32();
-                payload[0] = (uint8_t)(moduleKey & 0xFFU);
-                payload[1] = (uint8_t)((moduleKey >> 8) & 0xFFU);
-                payload[2] = (uint8_t)((moduleKey >> 16) & 0xFFU);
-                payload[3] = (uint8_t)((moduleKey >> 24) & 0xFFU);
-
-                (void)snprintf(keyText, sizeof(keyText),
-                               "Cle 32 bits generee par le maitre: 0x%08lX\r\n",
-                               (unsigned long)moduleKey);
-                Console_Write(keyText);
-
-                keyUpdatePending = true;
-                Protocol_SendUart1(CMD_UPDT_KEY, payload, 4U);
-                Console_Write("Commande UPDT_KEY envoyee a la carte esclave; attente ACK.\r\n");
-            }
-            else
-            {
-                Console_Write("GET_KEY refuse: commande reservee au maitre synchronise.\r\n");
             }
             break;
         }
@@ -1171,8 +1318,59 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
         }
 
         case CMD_RESET:
-            Console_Write("Commande RESET recue (traitement a implementer)\r\n");
+        {
+            uint8_t resetMode = message->payload[0];
+
+            if (item->source == RX_SOURCE_PC)
+            {
+                if (moduleIsMaster)
+                {
+                    if (resetPending)
+                    {
+                        Console_Write("REINITIALISATION deja en cours.\r\n");
+                        break;
+                    }
+
+                    resetPending = true;
+                    resetMode = 0U;
+                    Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
+                    Console_Write("REINITIALISATION envoyee a l'esclave; attente ACK.\r\n");
+                }
+                else
+                {
+                    resetMode = 1U;
+                    Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
+                    Console_Write("Demande de reinitialisation envoyee au maitre.\r\n");
+                }
+            }
+            else if (moduleIsMaster && (resetMode == 1U))
+            {
+                if (!resetPending)
+                {
+                    resetPending = true;
+                    resetMode = 0U;
+                    Protocol_SendUart1(CMD_RESET, &resetMode, 1U);
+                    Console_Write("Demande RESET de l'esclave: reinitialisation coordonnee lancee.\r\n");
+                }
+            }
+            else if ((!moduleIsMaster) && (resetMode == 0U))
+            {
+                moduleKey = 0U;
+                keyUpdatePending = false;
+                moduleState = MODULE_UNINITIALIZED;
+                moduleIsMaster = false;
+                modulePosition = 0U;
+                HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+                Console_Write("RESET recu: cle et etat local effaces.\r\n");
+                Protocol_SendUart1(CMD_ACK, NULL, 0U);
+                Console_Write("ACK RESET envoye au maitre.\r\n");
+            }
+            else
+            {
+                Console_Write("RESET ignore: role ou mode invalide.\r\n");
+            }
             break;
+        }
 
         case CMD_MSG:
         {
@@ -1193,9 +1391,20 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             {
                 char receivedText[MAX_PAYLOAD_SIZE + 1U];
                 uint8_t textLength = message->header.length;
-                memcpy(receivedText, message->payload, textLength);
+                uint8_t decryptedPayload[MAX_PAYLOAD_SIZE];
+
+                if (moduleKey == 0U)
+                {
+                    Console_Write("ERREUR: message chiffre recu mais aucune cle disponible.\r\n");
+                    break;
+                }
+
+                memcpy(decryptedPayload, message->payload, textLength);
+                Protocol_XorCrypt(decryptedPayload, textLength, moduleKey);
+                memcpy(receivedText, decryptedPayload, textLength);
                 receivedText[textLength] = '\0';
-                Console_Write("Message texte recu: ");
+
+                Console_Write("Message dechiffre recu: ");
                 Console_Write(receivedText);
                 Console_Write("\r\n");
             }
