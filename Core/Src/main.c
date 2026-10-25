@@ -59,13 +59,13 @@ osMessageQueueId_t txQueue;
 
 const osThreadAttr_t communicationTask_attributes = {
     .name = "communicationTask",
-    .stack_size = 512,
+    .stack_size = 2048,
     .priority = (osPriority_t) osPriorityNormal,
 };
 
 const osThreadAttr_t protocolTask_attributes = {
     .name = "protocolTask",
-    .stack_size = 512,
+    .stack_size = 2048,
     /* Prioritaire sur CommunicationTask pour traiter immediatement rxQueue. */
     .priority = (osPriority_t) osPriorityAboveNormal,
 };
@@ -107,6 +107,10 @@ static volatile ModuleState_t moduleState = MODULE_UNINITIALIZED;
 static volatile bool moduleIsMaster = false;
 static volatile uint8_t modulePosition = 0U;
 
+/* Cle de 32 bits stockee localement sur chaque carte. */
+static uint32_t moduleKey = 0U;
+static volatile bool keyUpdatePending = false;
+
 /* Reception USART1 et USART2 par interruption avec buffers circulaires. */
 #define UART1_RX_RING_SIZE 128U
 #define UART2_RX_RING_SIZE 128U
@@ -140,6 +144,7 @@ static void Console_ProcessLine(const char *line);
 static void Console_Write(const char *text);
 static void Console_WriteHexByte(uint8_t value);
 static void Protocol_SendUart1(uint8_t command, const uint8_t *payload, uint8_t length);
+static uint32_t Protocol_GenerateKey32(void);
 
 /* USER CODE BEGIN PFP */
 
@@ -205,6 +210,11 @@ int main(void)
   rxQueue = osMessageQueueNew(5, sizeof(RxQueueItem_t), NULL);
 
   txQueue = osMessageQueueNew(5, sizeof(ProtocolMessage_t), NULL);
+
+  if ((rxQueue == NULL) || (txQueue == NULL))
+  {
+      Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -472,7 +482,7 @@ void CommunicationTask(void *argument)
     (void)argument;
 
     Console_Write("Demarrage OK - USART1=interruptions, USART2=console PC\r\n");
-    Console_Write("Commandes: INIT, INFO (local), GET_INFO (infos esclave), puis texte (max 16 octets)\r\n");
+    Console_Write("Commandes: INIT, INFO, GET_INFO, GET_KEY, puis texte (max 16 octets)\r\n");
 
     /* Demarrer les receptions interruptives sur les deux UART. */
     rxStatus = HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U);
@@ -627,6 +637,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if ((huart != NULL) && (huart->Instance == USART1))
     {
+        /* Recuperer les erreurs HAL avant de relancer la reception. */
         (void)HAL_UART_AbortReceive(&huart1);
         (void)HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U);
     }
@@ -635,6 +646,36 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         (void)HAL_UART_AbortReceive(&huart2);
         (void)HAL_UART_Receive_IT(&huart2, &uart2RxByte, 1U);
     }
+}
+
+/*
+ * Genere une valeur pseudo-aleatoire de 32 bits pour les essais fonctionnels.
+ * IMPORTANT : ce generateur n'est pas cryptographiquement securise.
+ * Pour une vraie cle cryptographique, utiliser le RNG materiel s'il est
+ * disponible et active dans la configuration STM32CubeMX.
+ */
+static uint32_t Protocol_GenerateKey32(void)
+{
+    static uint32_t state = 0x6D2B79F5U;
+
+    state ^= HAL_GetTick();
+    state ^= SysTick->VAL;
+    if (state == 0U)
+    {
+        state = 0xA341316CU;
+    }
+
+    /* Xorshift32 */
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+
+    if (state == 0U)
+    {
+        state = 0xA341316CU;
+    }
+
+    return state;
 }
 
 static void Console_ProcessLine(const char *line)
@@ -731,6 +772,34 @@ static void Console_ProcessLine(const char *line)
         else
         {
             Console_Write("Demande GET_INFO ajoutee a la file de traitement.\r\n");
+        }
+        return;
+    }
+
+    /* GET_KEY : demande au maitre de generer une cle 32 bits et de la distribuer. */
+    if (strcmp(normalized, "GET_KEY") == 0)
+    {
+        if ((!moduleIsMaster) || (moduleState != MODULE_SYNCHRONIZED))
+        {
+            Console_Write("ERREUR: GET_KEY necessite un maitre initialise et synchronise.\r\n");
+            return;
+        }
+
+        item.message.header.start_byte = ICD_START_BYTE;
+        item.message.header.command_type = CMD_GET_KEY;
+        item.message.header.length = 0U;
+        item.message.header.reserve = 0U;
+        item.message.header.id_src = DEFAULT_ID;
+        item.message.crc = 0U;
+        item.source = RX_SOURCE_PC;
+
+        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+        {
+            Console_Write("ERREUR: impossible de mettre GET_KEY en file\r\n");
+        }
+        else
+        {
+            Console_Write("Demande GET_KEY ajoutee a la file de traitement.\r\n");
         }
         return;
     }
@@ -835,7 +904,9 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
         (message->header.command_type != CMD_MSG)           &&
         (message->header.command_type != CMD_ERROR)         &&
         (message->header.command_type != CMD_GET_INFO)      &&
-        (message->header.command_type != CMD_INFO_RESPONSE))
+        (message->header.command_type != CMD_INFO_RESPONSE)  &&
+        (message->header.command_type != CMD_GET_KEY)        &&
+        (message->header.command_type != CMD_UPDT_KEY))
     {
         return false;
     }
@@ -849,9 +920,17 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
         }
     }
     else if ((message->header.command_type == CMD_ACK) ||
-             (message->header.command_type == CMD_GET_INFO))
+             (message->header.command_type == CMD_GET_INFO) ||
+             (message->header.command_type == CMD_GET_KEY))
     {
         if (message->header.length != 0U)
+        {
+            return false;
+        }
+    }
+    else if (message->header.command_type == CMD_UPDT_KEY)
+    {
+        if (message->header.length != 4U)
         {
             return false;
         }
@@ -929,7 +1008,13 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
         }
 
         case CMD_ACK:
-            if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZING))
+            /* Priorite a l'ACK attendu pour UPDT_KEY. */
+            if (moduleIsMaster && keyUpdatePending)
+            {
+                keyUpdatePending = false;
+                Console_Write("ACK recu: cle mise a jour sur la carte esclave.\r\n");
+            }
+            else if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZING))
             {
                 moduleState = MODULE_SYNCHRONIZED;
                 HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
@@ -970,6 +1055,65 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
 
                 Protocol_SendUart1(CMD_INFO_RESPONSE, payload, 6U);
                 Console_Write("Reponse GET_INFO envoyee au maitre.\r\n");
+            }
+            break;
+        }
+
+        case CMD_GET_KEY:
+        {
+            if ((item->source == RX_SOURCE_PC) &&
+                moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
+            {
+                char keyText[96];
+                uint8_t payload[4];
+
+                moduleKey = Protocol_GenerateKey32();
+                payload[0] = (uint8_t)(moduleKey & 0xFFU);
+                payload[1] = (uint8_t)((moduleKey >> 8) & 0xFFU);
+                payload[2] = (uint8_t)((moduleKey >> 16) & 0xFFU);
+                payload[3] = (uint8_t)((moduleKey >> 24) & 0xFFU);
+
+                (void)snprintf(keyText, sizeof(keyText),
+                               "Cle 32 bits generee par le maitre: 0x%08lX\r\n",
+                               (unsigned long)moduleKey);
+                Console_Write(keyText);
+
+                keyUpdatePending = true;
+                Protocol_SendUart1(CMD_UPDT_KEY, payload, 4U);
+                Console_Write("Commande UPDT_KEY envoyee a la carte esclave; attente ACK.\r\n");
+            }
+            else
+            {
+                Console_Write("GET_KEY refuse: commande reservee au maitre synchronise.\r\n");
+            }
+            break;
+        }
+
+        case CMD_UPDT_KEY:
+        {
+            if ((item->source == RX_SOURCE_USART1) &&
+                (!moduleIsMaster) &&
+                (message->header.length == 4U))
+            {
+                moduleKey = ((uint32_t)message->payload[0]) |
+                            ((uint32_t)message->payload[1] << 8) |
+                            ((uint32_t)message->payload[2] << 16) |
+                            ((uint32_t)message->payload[3] << 24);
+
+                {
+                    char keyText[96];
+                    (void)snprintf(keyText, sizeof(keyText),
+                                   "Cle recue et stockee sur l'esclave: 0x%08lX\r\n",
+                                   (unsigned long)moduleKey);
+                    Console_Write(keyText);
+                }
+
+                Protocol_SendUart1(CMD_ACK, NULL, 0U);
+                Console_Write("ACK renvoye apres mise a jour de la cle.\r\n");
+            }
+            else
+            {
+                Console_Write("UPDT_KEY refuse: source ou longueur invalide.\r\n");
             }
             break;
         }
@@ -1093,7 +1237,7 @@ void ProtocolTask(void *argument)
             }
             else
             {
-                Console_Write("ERREUR: trame invalide (entete, commande ou longueur).\r\n");
+                Console_Write("ERREUR TRAME: commande invalide ou champs incoherents.\r\n");
             }
         }
     }

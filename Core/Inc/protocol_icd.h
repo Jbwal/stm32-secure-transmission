@@ -14,7 +14,9 @@ typedef enum {
     CMD_MSG           = 0x03, /* Transmission d'un message texte */
     CMD_ERROR         = 0x04, /* Erreur */
     CMD_GET_INFO      = 0x05, /* Demande des informations d'un noeud */
-    CMD_INFO_RESPONSE = 0x06  /* Reponse aux informations d'un noeud */
+    CMD_INFO_RESPONSE = 0x06, /* Reponse aux informations d'un noeud */
+    CMD_GET_KEY       = 0x07, /* Demande de generation d'une cle 32 bits */
+    CMD_UPDT_KEY      = 0x08  /* Transmission/mise a jour de la cle 32 bits */
 } CommandType_t;
 
 typedef struct __attribute__((packed)) {
