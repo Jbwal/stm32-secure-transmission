@@ -41,13 +41,13 @@ Inter-task communication uses FreeRTOS queues.
 ## 4. Development Roadmap
 
 - [x] Initial STM32CubeMX project setup
-- [ ] Define and validate the communication frame format
-- [ ] Implement UART communication between two boards
-- [ ] Implement protocol commands and responses
-- [ ] Implement module initialization and identification
-- [ ] Implement confidentiality and integrity mechanisms
-- [ ] Implement system status indicators
-- [ ] Test the complete communication chain
+- [X] Define and validate the communication frame format
+- [X] Implement UART communication between two boards
+- [X] Implement protocol commands and responses
+- [X] Implement module initialization and identification
+- [X] Implement confidentiality and integrity mechanisms
+- [X] Implement system status indicators
+- [X] Test the complete communication chain
 
 ## 5. Repository Structure
 
