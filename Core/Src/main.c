@@ -107,6 +107,22 @@ static volatile ModuleState_t moduleState = MODULE_UNINITIALIZED;
 static volatile bool moduleIsMaster = false;
 static volatile uint8_t modulePosition = 0U;
 
+/* Reception USART1 et USART2 par interruption avec buffers circulaires. */
+#define UART1_RX_RING_SIZE 128U
+#define UART2_RX_RING_SIZE 128U
+
+static uint8_t uart1RxByte;
+static uint8_t uart1RxRing[UART1_RX_RING_SIZE];
+static volatile uint16_t uart1RxHead = 0U;
+static volatile uint16_t uart1RxTail = 0U;
+static volatile uint32_t uart1RxDroppedBytes = 0U;
+
+static uint8_t uart2RxByte;
+static uint8_t uart2RxRing[UART2_RX_RING_SIZE];
+static volatile uint16_t uart2RxHead = 0U;
+static volatile uint16_t uart2RxTail = 0U;
+static volatile uint32_t uart2RxDroppedBytes = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -448,29 +464,37 @@ void CommunicationTask(void *argument)
     uint8_t frame[sizeof(ProtocolMessage_t)];
     size_t frameIndex = 0U;
     uint32_t lastFrameByteTick = 0U;
-
     char consoleLine[32];
     size_t consoleIndex = 0U;
     bool discardConsoleLine = false;
+    HAL_StatusTypeDef rxStatus;
 
     (void)argument;
 
-    Console_Write("Demarrage OK - USART1=liaison cartes, USART2=console PC\r\n");
-    Console_Write("Commande disponible: I puis Entree (ou INIT)\r\n");
+    Console_Write("Demarrage OK - USART1=interruptions, USART2=console PC\r\n");
+    Console_Write("Commandes: INIT, INFO (local), GET_INFO (infos esclave), puis texte (max 16 octets)\r\n");
+
+    /* Demarrer les receptions interruptives sur les deux UART. */
+    rxStatus = HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U);
+    if (rxStatus != HAL_OK)
+    {
+        Console_Write("ERREUR: impossible de demarrer la reception USART1 par interruption.\r\n");
+    }
+
+    rxStatus = HAL_UART_Receive_IT(&huart2, &uart2RxByte, 1U);
+    if (rxStatus != HAL_OK)
+    {
+        Console_Write("ERREUR: impossible de demarrer la reception USART2 par interruption.\r\n");
+    }
 
     for (;;)
     {
-        /* Abandonner une trame partielle si aucun octet n'arrive pendant 20 ms. */
-        if ((frameIndex > 0U) &&
-            ((HAL_GetTick() - lastFrameByteTick) > 20U))
+        /* Traiter rapidement tous les octets USART1 mis en tampon par l'interruption. */
+        while (uart1RxTail != uart1RxHead)
         {
-            frameIndex = 0U;
-            Console_Write("\r\nERREUR: trame USART1 incomplete, abandonnee.\r\n");
-        }
+            rxByte = uart1RxRing[uart1RxTail];
+            uart1RxTail = (uint16_t)((uart1RxTail + 1U) % UART1_RX_RING_SIZE);
 
-        /* USART1 : scrutation non bloquante, sans affichage pendant la reception. */
-        if (HAL_UART_Receive(&huart1, &rxByte, 1U, 0U) == HAL_OK)
-        {
             if (frameIndex == 0U)
             {
                 if (rxByte == ICD_START_BYTE)
@@ -492,18 +516,7 @@ void CommunicationTask(void *argument)
                     item.source = RX_SOURCE_USART1;
                     frameIndex = 0U;
 
-                    Console_Write("\r\nTrame complete recue sur USART1 : ");
-                    for (size_t i = 0U; i < sizeof(frame); i++)
-                    {
-                        Console_WriteHexByte(frame[i]);
-                    }
-                    Console_Write("\r\n");
-
-                    if (!Protocol_IsMessageValid(&item.message))
-                    {
-                        Console_Write("ERREUR: trame invalide (entete, commande ou longueur).\r\n");
-                    }
-                    else if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+                    if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
                     {
                         Console_Write("ERREUR: file RX pleine, trame perdue.\r\n");
                     }
@@ -511,9 +524,32 @@ void CommunicationTask(void *argument)
             }
         }
 
-        /* USART2 : lire la console sans bloquer la reception USART1. */
-        if (HAL_UART_Receive(&huart2, &rxByte, 1U, 0U) == HAL_OK)
+        /* Diagnostic si une trame commence mais ne se termine pas. */
+        if ((frameIndex > 0U) && ((HAL_GetTick() - lastFrameByteTick) > 100U))
         {
+            char debugMessage[96];
+            (void)snprintf(debugMessage, sizeof(debugMessage),
+                           "\r\nERREUR: trame USART1 incomplete, %lu/%lu octets recus.\r\n",
+                           (unsigned long)frameIndex, (unsigned long)sizeof(frame));
+            Console_Write(debugMessage);
+            Console_Write("Debut de trame: ");
+            for (size_t i = 0U; (i < frameIndex) && (i < 8U); i++)
+            {
+                Console_WriteHexByte(frame[i]);
+            }
+            Console_Write("\r\n");
+            frameIndex = 0U;
+        }
+
+        /*
+         * USART2 : traiter tous les octets de console captures par interruption.
+         * On vide le ring buffer, pas un seul octet par tour de boucle.
+         */
+        while (uart2RxTail != uart2RxHead)
+        {
+            rxByte = uart2RxRing[uart2RxTail];
+            uart2RxTail = (uint16_t)((uart2RxTail + 1U) % UART2_RX_RING_SIZE);
+
             if ((rxByte == '\r') || (rxByte == '\n'))
             {
                 if (!discardConsoleLine && (consoleIndex > 0U))
@@ -521,7 +557,6 @@ void CommunicationTask(void *argument)
                     consoleLine[consoleIndex] = '\0';
                     Console_ProcessLine(consoleLine);
                 }
-
                 consoleIndex = 0U;
                 discardConsoleLine = false;
             }
@@ -540,7 +575,65 @@ void CommunicationTask(void *argument)
             }
         }
 
-        /* Pas de delai ici : la reception USART1 est scrutee en continu. */
+        osDelay(1U);
+    }
+}
+
+/*
+ * Reception USART1 par interruption. Cette routine ne fait aucun affichage
+ * et n'appelle pas FreeRTOS : elle depose seulement l'octet dans le ring buffer.
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1))
+    {
+        uint16_t nextHead = (uint16_t)((uart1RxHead + 1U) % UART1_RX_RING_SIZE);
+        if (nextHead != uart1RxTail)
+        {
+            uart1RxRing[uart1RxHead] = uart1RxByte;
+            uart1RxHead = nextHead;
+        }
+        else
+        {
+            uart1RxDroppedBytes++;
+        }
+
+        if (HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U) != HAL_OK)
+        {
+            uart1RxDroppedBytes++;
+        }
+    }
+    else if ((huart != NULL) && (huart->Instance == USART2))
+    {
+        uint16_t nextHead = (uint16_t)((uart2RxHead + 1U) % UART2_RX_RING_SIZE);
+        if (nextHead != uart2RxTail)
+        {
+            uart2RxRing[uart2RxHead] = uart2RxByte;
+            uart2RxHead = nextHead;
+        }
+        else
+        {
+            uart2RxDroppedBytes++;
+        }
+
+        if (HAL_UART_Receive_IT(&huart2, &uart2RxByte, 1U) != HAL_OK)
+        {
+            uart2RxDroppedBytes++;
+        }
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1))
+    {
+        (void)HAL_UART_AbortReceive(&huart1);
+        (void)HAL_UART_Receive_IT(&huart1, &uart1RxByte, 1U);
+    }
+    else if ((huart != NULL) && (huart->Instance == USART2))
+    {
+        (void)HAL_UART_AbortReceive(&huart2);
+        (void)HAL_UART_Receive_IT(&huart2, &uart2RxByte, 1U);
     }
 }
 
@@ -614,6 +707,72 @@ static void Console_ProcessLine(const char *line)
         return;
     }
 
+    /* GET_INFO demande au maitre les informations de la carte esclave. */
+    if (strcmp(normalized, "GET_INFO") == 0)
+    {
+        if ((!moduleIsMaster) || (moduleState != MODULE_SYNCHRONIZED))
+        {
+            Console_Write("ERREUR: GET_INFO necessite un maitre initialise et synchronise.\r\n");
+            return;
+        }
+
+        item.message.header.start_byte = ICD_START_BYTE;
+        item.message.header.command_type = CMD_GET_INFO;
+        item.message.header.length = 0U;
+        item.message.header.reserve = 0U;
+        item.message.header.id_src = DEFAULT_ID;
+        item.message.crc = 0U;
+        item.source = RX_SOURCE_PC;
+
+        if (osMessageQueuePut(rxQueue, &item, 0U, 0U) != osOK)
+        {
+            Console_Write("ERREUR: impossible de mettre GET_INFO en file\r\n");
+        }
+        else
+        {
+            Console_Write("Demande GET_INFO ajoutee a la file de traitement.\r\n");
+        }
+        return;
+    }
+
+    /* INFO est une commande locale : elle ne modifie pas le protocole ICD. */
+    if (strcmp(normalized, "INFO") == 0)
+    {
+        char info[160];
+        const char *role;
+        const char *state;
+
+        if (moduleState == MODULE_UNINITIALIZED)
+        {
+            role = "NON DEFINI";
+            state = "NON INITIALISE";
+        }
+        else
+        {
+            role = moduleIsMaster ? "MAITRE" : "ESCLAVE";
+            if (moduleState == MODULE_SYNCHRONIZING)
+            {
+                state = "SYNCHRONISATION EN COURS";
+            }
+            else
+            {
+                state = "SYNCHRONISE";
+            }
+        }
+
+        (void)snprintf(info, sizeof(info),
+                       "\r\n--- INFORMATIONS DU MODULE ---\r\n"
+                       "Identifiant (DEFAULT_ID): %lu\r\n"
+                       "Role: %s\r\n"
+                       "Position: %u\r\n"
+                       "Statut: %s\r\n"
+                       "------------------------------\r\n",
+                       (unsigned long)DEFAULT_ID, role,
+                       (unsigned int)modulePosition, state);
+        Console_Write(info);
+        return;
+    }
+
     /* Toute autre ligne est un message texte, limite a la taille du payload ICD. */
     if (length > MAX_PAYLOAD_SIZE)
     {
@@ -670,11 +829,13 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
     }
 
     /* Refuser les valeurs de commande qui ne sont pas definies dans l'ICD. */
-    if ((message->header.command_type != CMD_INIT)  &&
-        (message->header.command_type != CMD_RESET) &&
-        (message->header.command_type != CMD_ACK)   &&
-        (message->header.command_type != CMD_MSG)   &&
-        (message->header.command_type != CMD_ERROR))
+    if ((message->header.command_type != CMD_INIT)          &&
+        (message->header.command_type != CMD_RESET)         &&
+        (message->header.command_type != CMD_ACK)           &&
+        (message->header.command_type != CMD_MSG)           &&
+        (message->header.command_type != CMD_ERROR)         &&
+        (message->header.command_type != CMD_GET_INFO)      &&
+        (message->header.command_type != CMD_INFO_RESPONSE))
     {
         return false;
     }
@@ -687,9 +848,18 @@ static bool Protocol_IsMessageValid(const ProtocolMessage_t *message)
             return false;
         }
     }
-    else if (message->header.command_type == CMD_ACK)
+    else if ((message->header.command_type == CMD_ACK) ||
+             (message->header.command_type == CMD_GET_INFO))
     {
         if (message->header.length != 0U)
+        {
+            return false;
+        }
+    }
+    else if (message->header.command_type == CMD_INFO_RESPONSE)
+    {
+        /* id (4 octets) + position (1 octet) + statut (1 octet). */
+        if (message->header.length != 6U)
         {
             return false;
         }
@@ -771,6 +941,91 @@ static void Protocol_ProcessMessage(const RxQueueItem_t *item)
             }
             break;
 
+        case CMD_GET_INFO:
+        {
+            if (item->source == RX_SOURCE_PC)
+            {
+                if (moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
+                {
+                    Protocol_SendUart1(CMD_GET_INFO, NULL, 0U);
+                    Console_Write("Demande GET_INFO transmise a la carte esclave.\r\n");
+                }
+                else
+                {
+                    Console_Write("GET_INFO refuse: seul le maitre synchronise peut envoyer cette demande.\r\n");
+                }
+            }
+            else
+            {
+                /* ID encode explicitement en little-endian, puis position et statut. */
+                uint8_t payload[6];
+                uint32_t id = DEFAULT_ID;
+
+                payload[0] = (uint8_t)(id & 0xFFU);
+                payload[1] = (uint8_t)((id >> 8) & 0xFFU);
+                payload[2] = (uint8_t)((id >> 16) & 0xFFU);
+                payload[3] = (uint8_t)((id >> 24) & 0xFFU);
+                payload[4] = modulePosition;
+                payload[5] = (uint8_t)moduleState;
+
+                Protocol_SendUart1(CMD_INFO_RESPONSE, payload, 6U);
+                Console_Write("Reponse GET_INFO envoyee au maitre.\r\n");
+            }
+            break;
+        }
+
+        case CMD_INFO_RESPONSE:
+        {
+            if ((item->source == RX_SOURCE_USART1) &&
+                moduleIsMaster && (moduleState == MODULE_SYNCHRONIZED))
+            {
+                uint32_t id;
+                uint8_t position = message->payload[4];
+                uint8_t status = message->payload[5];
+                const char *statusText;
+
+                id = ((uint32_t)message->payload[0]) |
+                     ((uint32_t)message->payload[1] << 8) |
+                     ((uint32_t)message->payload[2] << 16) |
+                     ((uint32_t)message->payload[3] << 24);
+
+                switch (status)
+                {
+                    case MODULE_UNINITIALIZED:
+                        statusText = "NON INITIALISE";
+                        break;
+                    case MODULE_SYNCHRONIZING:
+                        statusText = "SYNCHRONISATION EN COURS";
+                        break;
+                    case MODULE_SYNCHRONIZED:
+                        statusText = "SYNCHRONISE";
+                        break;
+                    default:
+                        statusText = "INCONNU";
+                        break;
+                }
+
+                {
+                    char info[160];
+                    (void)snprintf(info, sizeof(info),
+                                   "\r\n--- INFORMATIONS DE L'ESCLAVE ---\r\n"
+                                   "Identifiant: %lu\r\n"
+                                   "Position: %u\r\n"
+                                   "Statut: %s\r\n"
+                                   "----------------------------------\r\n",
+                                   (unsigned long)id,
+                                   (unsigned int)position,
+                                   statusText);
+                    Console_Write(info);
+                }
+            }
+            else
+            {
+                Console_Write("Reponse INFO recue hors contexte, ignoree.\r\n");
+            }
+            break;
+        }
+
         case CMD_RESET:
             Console_Write("Commande RESET recue (traitement a implementer)\r\n");
             break;
@@ -822,9 +1077,23 @@ void ProtocolTask(void *argument)
     {
         if (osMessageQueueGet(rxQueue, &item, NULL, osWaitForever) == osOK)
         {
+            if (item.source == RX_SOURCE_USART1)
+            {
+                Console_Write("\r\nTrame complete recue sur USART1 : ");
+                for (size_t i = 0U; i < sizeof(ProtocolMessage_t); i++)
+                {
+                    Console_WriteHexByte(((const uint8_t *)&item.message)[i]);
+                }
+                Console_Write("\r\n");
+            }
+
             if (Protocol_IsMessageValid(&item.message))
             {
                 Protocol_ProcessMessage(&item);
+            }
+            else
+            {
+                Console_Write("ERREUR: trame invalide (entete, commande ou longueur).\r\n");
             }
         }
     }
